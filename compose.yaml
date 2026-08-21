@@ -1,0 +1,63 @@
+name: rag-boilerplate
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    restart: unless-stopped
+    expose:
+      - "6333"
+      - "6334"
+    ports:
+      # Development-only convenience. Remove this mapping in production.
+      - "${QDRANT_PORT:-6333}:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://localhost:6333/readyz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - rag-internal
+
+  core-rag-api:
+    build:
+      context: ./services/core-rag-api
+    profiles: ["application"]
+    environment:
+      RAG_PORT: "8000"
+      EMBEDDING_BASE_URL: "${EMBEDDING_BASE_URL:-http://embedding-api:8001}"
+      VECTOR_DB_URL: "${VECTOR_DB_URL:-http://qdrant:6333}"
+    expose:
+      - "8000"
+    ports:
+      - "${RAG_CORE_PORT:-8000}:8000"
+    depends_on:
+      qdrant:
+        condition: service_healthy
+      embedding-api:
+        condition: service_started
+    networks:
+      - rag-internal
+    # Intentionally no command or healthcheck yet: app code/dependencies do not exist.
+
+  embedding-api:
+    build:
+      context: ./services/embedding-api
+    profiles: ["application"]
+    environment:
+      EMBEDDING_PORT: "8001"
+      DEFAULT_EMBEDDING_MODEL: "${DEFAULT_EMBEDDING_MODEL:-replace-with-a-pinned-model-revision}"
+    expose:
+      - "8001"
+    networks:
+      - rag-internal
+    # Intentionally no command or healthcheck yet: app code/dependencies do not exist.
+
+networks:
+  rag-internal:
+    driver: bridge
+
+volumes:
+  qdrant-data:
