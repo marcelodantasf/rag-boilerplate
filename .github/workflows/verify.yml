@@ -1,0 +1,63 @@
+name: verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-contract-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.1"
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+      - run: ./scripts/verify-rag-core.sh unit
+      - run: ./scripts/verify-rag-core.sh contract
+      - run: ./scripts/verify-rag-core.sh image
+      - run: ./scripts/verify-rag-core.sh observability
+
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.1"
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+      - run: ./scripts/verify-rag-core.sh integration
+      - run: ./scripts/verify-rag-core.sh recovery
+
+  end-to-end:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.1"
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.13"
+      - run: ./scripts/verify-rag-core.sh model
+      - run: ./scripts/verify-rag-core.sh e2e
+      - run: ./scripts/verify-rag-core.sh load
