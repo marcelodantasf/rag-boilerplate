@@ -12,23 +12,60 @@ services:
       - "${QDRANT_PORT:-6333}:6333"
     volumes:
       - qdrant-data:/qdrant/storage
+      - qdrant-snapshots:/qdrant/snapshots
     healthcheck:
-      test: ["CMD-SHELL", "curl --fail --silent http://localhost:6333/readyz || exit 1"]
+      test:
+        - CMD-SHELL
+        - >-
+          timeout 2 bash -c "exec 3<>/dev/tcp/127.0.0.1/6333;
+          printf 'GET /readyz HTTP/1.0\r\n\r\n' >&3;
+          grep -q '200 OK' <&3"
       interval: 10s
       timeout: 3s
       retries: 10
       start_period: 10s
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
     networks:
-      - rag-internal
+      - rag-data
+      # Single-member development bridge enabling the localhost port above.
+      # Application containers do not join this network.
+      - qdrant-dev
 
   core-rag-api:
     build:
       context: ./services/core-rag-api
     profiles: ["application"]
+    restart: unless-stopped
     environment:
       RAG_PORT: "8000"
       EMBEDDING_BASE_URL: "${EMBEDDING_BASE_URL:-http://embedding-api:8001}"
+      EMBEDDING_TIMEOUT_MS: "${EMBEDDING_TIMEOUT_MS:-10000}"
       VECTOR_DB_URL: "${VECTOR_DB_URL:-http://qdrant:6333}"
+      VECTOR_DB_API_KEY: "${VECTOR_DB_API_KEY:-}"
+      DEFAULT_EMBEDDING_MODEL: "${DEFAULT_MODEL_ID:-all-MiniLM-L6-v2}"
+      EMBEDDING_MODEL_REVISION: "${MODEL_REVISION:-c9745ed1d9f207416be6d2e6f8de32d1f16199bf}"
+      EMBEDDING_DIMENSION: "${EXPECTED_DIMENSION:-384}"
+      NORMALIZE_EMBEDDINGS: "${NORMALIZE_EMBEDDINGS:-true}"
+      DISTANCE_METRIC: "${DISTANCE_METRIC:-cosine}"
+      DEFAULT_CHUNK_SIZE: "${DEFAULT_CHUNK_SIZE:-1000}"
+      DEFAULT_CHUNK_OVERLAP: "${DEFAULT_CHUNK_OVERLAP:-200}"
+      MAX_DOCUMENT_BYTES: "${MAX_DOCUMENT_BYTES:-262144}"
+      MAX_CHUNKS_PER_DOCUMENT: "${MAX_CHUNKS_PER_DOCUMENT:-512}"
+      MAX_EMBEDDING_BATCH_ITEMS: "${MAX_EMBEDDING_BATCH_ITEMS:-64}"
+      MAX_SEARCH_TOP_K: "${MAX_SEARCH_TOP_K:-100}"
+      MAX_QUERY_BYTES: "${MAX_QUERY_BYTES:-16384}"
+      MAX_METADATA_FIELDS: "${MAX_METADATA_FIELDS:-32}"
+      MAX_METADATA_VALUE_BYTES: "${MAX_METADATA_VALUE_BYTES:-1024}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      OTEL_SERVICE_NAME: "rag-core-api"
+      OTEL_RESOURCE_ATTRIBUTES: "service.version=0.1.0,deployment.environment=${DEPLOYMENT_ENVIRONMENT:-local}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
+      OTEL_METRIC_EXPORT_INTERVAL: "10000"
     expose:
       - "8000"
     ports:
@@ -37,27 +74,233 @@ services:
       qdrant:
         condition: service_healthy
       embedding-api:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
     networks:
-      - rag-internal
-    # Intentionally no command or healthcheck yet: app code/dependencies do not exist.
+      - rag-api
+      - rag-data
 
   embedding-api:
     build:
       context: ./services/embedding-api
-    profiles: ["application"]
+    profiles: ["embedding", "application"]
+    restart: unless-stopped
     environment:
       EMBEDDING_PORT: "8001"
-      DEFAULT_EMBEDDING_MODEL: "${DEFAULT_EMBEDDING_MODEL:-replace-with-a-pinned-model-revision}"
+      DEFAULT_MODEL_ID: "${DEFAULT_MODEL_ID:-all-MiniLM-L6-v2}"
+      MODEL_SOURCE: "${MODEL_SOURCE:-sentence-transformers/all-MiniLM-L6-v2}"
+      MODEL_REVISION: "${MODEL_REVISION:-c9745ed1d9f207416be6d2e6f8de32d1f16199bf}"
+      EXPECTED_DIMENSION: "${EXPECTED_DIMENSION:-384}"
+      INFERENCE_DEVICE: "${INFERENCE_DEVICE:-cpu}"
+      MODEL_CACHE_DIR: "/var/cache/embedding-model"
+      NORMALIZE_EMBEDDINGS: "${NORMALIZE_EMBEDDINGS:-true}"
+      ENGINE_BATCH_SIZE: "${ENGINE_BATCH_SIZE:-32}"
+      MAX_BATCH_ITEMS: "${MAX_BATCH_ITEMS:-64}"
+      MAX_INPUT_BYTES: "${MAX_INPUT_BYTES:-65536}"
+      MAX_TOTAL_INPUT_BYTES: "${MAX_TOTAL_INPUT_BYTES:-262144}"
+      MAX_BATCH_TOKENS: "${MAX_BATCH_TOKENS:-8192}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      OTEL_SERVICE_NAME: "embedding-api"
+      OTEL_RESOURCE_ATTRIBUTES: "service.version=0.1.0,deployment.environment=${DEPLOYMENT_ENVIRONMENT:-local}"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://otel-collector:4318}"
+      OTEL_EXPORTER_OTLP_PROTOCOL: "http/protobuf"
     expose:
       - "8001"
+    ports:
+      # Development-only convenience; keep the service private in production.
+      - "${EMBEDDING_API_PORT:-8001}:8001"
+    volumes:
+      - embedding-model-cache:/var/cache/embedding-model
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health/ready', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 180s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
     networks:
-      - rag-internal
-    # Intentionally no command or healthcheck yet: app code/dependencies do not exist.
+      - rag-api
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    expose:
+      - "4317"
+      - "4318"
+      - "9464"
+      - "13133"
+    depends_on:
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - rag-api
+      - rag-data
+      - observability
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - ./observability/alerts.yaml:/etc/prometheus/alerts.yaml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    depends_on:
+      otel-collector:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - rag-api
+      - rag-data
+      - observability
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo/config.yaml"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo/config.yaml:ro
+      - tempo-data:/var/tempo
+    expose:
+      - "3200"
+      - "4317"
+      - "4318"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - observability
+
+  loki:
+    image: grafana/loki:3.2.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./observability/loki.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    expose:
+      - "3100"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - observability
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    profiles: ["observability"]
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-admin}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    depends_on:
+      prometheus:
+        condition: service_started
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - observability
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    profiles: ["observability"]
+    restart: unless-stopped
+    privileged: true
+    command: ["--docker_only=true", "--housekeeping_interval=15s"]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    expose:
+      - "8080"
+    networks:
+      - observability
 
 networks:
-  rag-internal:
+  rag-api:
+    driver: bridge
+  rag-data:
+    driver: bridge
+    internal: true
+  qdrant-dev:
+    driver: bridge
+  observability:
     driver: bridge
 
 volumes:
   qdrant-data:
+  qdrant-snapshots:
+  embedding-model-cache:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  grafana-data:

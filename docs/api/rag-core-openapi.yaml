@@ -1,0 +1,1053 @@
+openapi: 3.1.0
+info:
+  title: RAG Core API
+  version: 1.0.0
+  summary: Product-level document indexing, retrieval, and logical vector collection management.
+  description: |
+    RAG Core is the only application-facing boundary for RAG operations and the
+    only application client of the vector database. Consumers submit text and
+    provider-neutral filters; they never submit vectors, Qdrant filters, physical
+    collection names, point IDs, or database credentials.
+
+    A retrieval is one product operation: Core validates policy, embeds the query,
+    searches the active compatible collection generation, applies filters and
+    thresholds, and returns ranked citable chunks.
+
+    Collection endpoints manage logical index contracts and their generations.
+    Cluster administration, snapshots, restore, replication, patching, and storage
+    remain platform responsibilities.
+  contact:
+    name: RAG Core maintainers
+  license:
+    name: Repository license
+servers:
+  - url: http://localhost:8000
+    description: Local Compose environment
+tags:
+  - name: RAG operations
+    description: Complete document-ingestion, retrieval, and deletion operations.
+  - name: Vector collections
+    description: Provider-neutral logical collection contracts and generation lifecycle.
+  - name: Health
+    description: Process liveness and bounded dependency readiness.
+security: []
+paths:
+  /v1/rag/documents:
+    post:
+      tags: [RAG operations]
+      operationId: ingestDocument
+      summary: Normalize, chunk, embed, and index one document
+      description: |
+        Synchronously indexes one bounded document into the active generation of a
+        logical collection. Chunk and point identities are deterministic, so replaying
+        the same request updates the same records rather than creating duplicates.
+
+        `Idempotency-Key` is strongly recommended. A key is scoped to the authenticated
+        tenant and operation and bound to a canonical request fingerprint. Reusing it
+        with a different request returns
+        `idempotency_conflict`. A completed replay returns the original status and body
+        with `Idempotency-Replayed: true`.
+
+        Re-indexing the same `document_id` with changed content is replacement, not
+        append: the new deterministic version is fully upserted before older versions
+        are removed. A transient cleanup failure returns an error and is repaired by
+        replaying the request; retrieval de-duplicates a document/version transition.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestDocumentRequest'
+            examples:
+              handbook:
+                value:
+                  collection_id: employee-handbook
+                  document_id: leave-policy-2026
+                  content: "Parental leave is available for sixteen weeks. Requests are submitted to People Operations."
+                  metadata:
+                    department: people
+                    language: en
+                    year: 2026
+      responses:
+        '201':
+          description: Document indexed for the first time for this request.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestDocumentResponse' }
+              example:
+                collection_id: employee-handbook
+                generation_id: gen_01JX0X7V6K3Y1QMMX6P8G4R9Y2
+                document_id: leave-policy-2026
+                document_version: sha256:2f745c5f8d7d9c06c10ca6a540d21ce4a8f8a51296f96d0a7ca7b7cf04db9424
+                chunks_indexed: 1
+                status: indexed
+        '200':
+          description: A completed idempotent request was replayed.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestDocumentResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/LimitExceeded' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '502': { $ref: '#/components/responses/DependencyContractViolation' }
+        '503': { $ref: '#/components/responses/DependencyUnavailable' }
+        '504': { $ref: '#/components/responses/DependencyTimeout' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/rag/documents/{document_id}:
+    delete:
+      tags: [RAG operations]
+      operationId: deleteDocument
+      summary: Delete every indexed chunk for a document
+      description: |
+        Deletes all versions and chunks for `document_id` in the active collection
+        generation. The operation is inherently idempotent: an already absent document
+        returns `200` with `chunks_deleted: 0`. It never deletes a source-of-truth
+        document outside the vector index.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+        - name: document_id
+          in: path
+          required: true
+          schema: { $ref: '#/components/schemas/DocumentId' }
+        - name: collection_id
+          in: query
+          required: true
+          description: Logical collection identifier; never a provider collection name.
+          schema: { $ref: '#/components/schemas/CollectionId' }
+      responses:
+        '200':
+          description: All matching chunks are absent after the operation.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeleteDocumentResponse' }
+              example:
+                collection_id: employee-handbook
+                generation_id: gen_01JX0X7V6K3Y1QMMX6P8G4R9Y2
+                document_id: leave-policy-2026
+                chunks_deleted: 4
+                status: deleted
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '503': { $ref: '#/components/responses/DependencyUnavailable' }
+        '504': { $ref: '#/components/responses/DependencyTimeout' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/rag/retrievals:
+    post:
+      tags: [RAG operations]
+      operationId: retrieveTopKChunks
+      summary: Retrieve the top-k citable chunks for a natural-language query
+      description: |
+        Embeds the query exactly once, validates the embedding against the active
+        collection contract, combines consumer filters with trusted server-derived
+        tenant/access filters, searches the vector store, normalizes scores, applies
+        `minimum_score`, and returns ranked chunks.
+
+        `score` is in `[0,1]` and is monotonic for a collection's metric, but it is not
+        a probability and must not be compared across collections or embedding models.
+        Results are sorted by descending score with `chunk_id` as the stable tie-breaker.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RetrievalRequest' }
+            examples:
+              filtered:
+                value:
+                  collection_id: employee-handbook
+                  query: How long is parental leave?
+                  top_k: 5
+                  minimum_score: 0.65
+                  filter:
+                    all:
+                      - field: department
+                        operator: eq
+                        value: people
+                      - field: year
+                        operator: gte
+                        value: 2025
+      responses:
+        '200':
+          description: Ranked results; an empty array is a successful no-match result.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetrievalResponse' }
+              example:
+                collection_id: employee-handbook
+                generation_id: gen_01JX0X7V6K3Y1QMMX6P8G4R9Y2
+                query: How long is parental leave?
+                top_k: 5
+                results:
+                  - rank: 1
+                    chunk_id: chk_f906bb6b-23b1-5a92-a91e-41b7aad73347
+                    document_id: leave-policy-2026
+                    document_version: sha256:2f745c5f8d7d9c06c10ca6a540d21ce4a8f8a51296f96d0a7ca7b7cf04db9424
+                    text: Parental leave is available for sixteen weeks.
+                    score: 0.9132
+                    metadata:
+                      department: people
+                      year: 2026
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '413': { $ref: '#/components/responses/LimitExceeded' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '502': { $ref: '#/components/responses/DependencyContractViolation' }
+        '503': { $ref: '#/components/responses/DependencyUnavailable' }
+        '504': { $ref: '#/components/responses/DependencyTimeout' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/vector-collections:
+    post:
+      tags: [Vector collections]
+      operationId: createVectorCollection
+      summary: Create a logical collection and its first physical generation
+      description: |
+        Creates an immutable embedding/index contract, provider collection, approved
+        payload indexes, and durable catalog record. The first generation becomes
+        active only after provider verification succeeds. The logical ID is stable;
+        physical names never appear in this API.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCollectionRequest' }
+            example:
+              collection_id: employee-handbook
+              embedding:
+                model_id: all-MiniLM-L6-v2
+                revision: c9745ed1d9f207416be6d2e6f8de32d1f16199bf
+                dimension: 384
+                normalized: true
+                distance_metric: cosine
+              index_schema_version: 1
+              metadata_fields:
+                - { name: department, type: keyword, indexed: true }
+                - { name: language, type: keyword, indexed: true }
+                - { name: year, type: integer, indexed: true }
+              isolation_policy: shared
+      responses:
+        '201':
+          description: Logical collection and active generation created.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+            Location:
+              description: Relative URI of the logical collection.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Collection' }
+        '200':
+          description: A completed idempotent create request was replayed.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+            Location:
+              description: Relative URI of the logical collection.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Collection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '503': { $ref: '#/components/responses/DependencyUnavailable' }
+        '504': { $ref: '#/components/responses/DependencyTimeout' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    get:
+      tags: [Vector collections]
+      operationId: listVectorCollections
+      summary: List logical collections
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+        - name: cursor
+          in: query
+          description: Opaque cursor returned by the previous page.
+          schema: { type: string, maxLength: 512 }
+      responses:
+        '200':
+          description: A stable page ordered by logical collection ID.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CollectionPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '503': { $ref: '#/components/responses/DependencyUnavailable' }
+        '504': { $ref: '#/components/responses/DependencyTimeout' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/vector-collections/{collection_id}:
+    get:
+      tags: [Vector collections]
+      operationId: getVectorCollection
+      summary: Inspect a logical collection and all retained generations
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+        - $ref: '#/components/parameters/CollectionIdPath'
+      responses:
+        '200':
+          description: Logical collection contract and lifecycle.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Collection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/DependencyUnavailable' }
+        '504': { $ref: '#/components/responses/DependencyTimeout' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    delete:
+      tags: [Vector collections]
+      operationId: retireVectorCollection
+      summary: Deliberately retire a logical collection
+      description: |
+        Marks the logical collection and all its generations retired and removes its
+        active alias. It does not immediately destroy physical data; platform retention
+        and a separately authorized cleanup process provide rollback protection.
+
+        The exact logical ID must be repeated in `X-Confirm-Retirement`, and
+        `If-Match` must contain the currently active `generation_id`. Missing or stale
+        safeguards return `412`. Retrieval and ingestion stop immediately after
+        successful retirement.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+        - $ref: '#/components/parameters/CollectionIdPath'
+        - name: X-Confirm-Retirement
+          in: header
+          required: true
+          description: Must exactly equal the decoded `collection_id` path value.
+          schema: { $ref: '#/components/schemas/CollectionId' }
+        - name: If-Match
+          in: header
+          required: true
+          description: Current active generation ID, preventing stale destructive actions.
+          schema: { $ref: '#/components/schemas/GenerationId' }
+      responses:
+        '200':
+          description: Collection retired; physical data remains under retention policy.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RetirementResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '503': { $ref: '#/components/responses/DependencyUnavailable' }
+        '504': { $ref: '#/components/responses/DependencyTimeout' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/vector-collections/{collection_id}/generations:
+    post:
+      tags: [Vector collections]
+      operationId: provisionVectorCollectionGeneration
+      summary: Provision and verify an empty immutable collection generation
+      description: |
+        Creates a target provider collection and approved payload indexes, verifies
+        their compatibility, and leaves the new generation `ready`. The current active
+        generation remains readable and writable throughout. This operation does not
+        copy, re-embed, re-chunk, or validate documents and never activates the target.
+
+        Before activation, an authorized out-of-band workflow must rebuild the target
+        from the external source of truth and validate count, isolation, filters, and
+        retrieval quality. The public document-ingestion route writes only to the active
+        generation, so activating an empty target is unsafe for a data-bearing
+        collection.
+
+        `Idempotency-Key` binds the logical collection ID and canonical request. A
+        completed replay returns the original body with `200` and
+        `Idempotency-Replayed: true`; a different request returns
+        `idempotency_conflict`.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/CollectionIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProvisionGenerationRequest' }
+            example:
+              embedding:
+                model_id: all-MiniLM-L6-v2
+                revision: 6f4f3d2c1b0a9876543210fedcba123456789abc
+                dimension: 384
+                normalized: true
+                distance_metric: cosine
+              index_schema_version: 2
+              metadata_fields:
+                - { name: department, type: keyword, indexed: true }
+                - { name: language, type: keyword, indexed: true }
+                - { name: year, type: integer, indexed: true }
+      responses:
+        '201':
+          description: Empty generation provisioned, provider-verified, and ready for an out-of-band rebuild.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+            Location:
+              description: URI of the containing logical collection and generation history.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProvisionGenerationResponse' }
+              example:
+                collection_id: employee-handbook
+                generation_id: gen_01JX1M7WZ9G9VPHN4HM7FZAAK7
+                state: ready
+        '200':
+          description: A completed idempotent provisioning request was replayed.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+            Idempotency-Replayed: { $ref: '#/components/headers/IdempotencyReplayed' }
+            Location:
+              description: URI of the containing logical collection and generation history.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProvisionGenerationResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '503': { $ref: '#/components/responses/DependencyUnavailable' }
+        '504': { $ref: '#/components/responses/DependencyTimeout' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /v1/vector-collections/{collection_id}/activate:
+    post:
+      tags: [Vector collections]
+      operationId: activateVectorCollectionGeneration
+      summary: Atomically switch reads and writes to a validated generation
+      description: |
+        Activates only a `ready` generation whose immutable contract matches the
+        catalog. Alias cutover and catalog state transition must behave atomically from
+        a caller's perspective. The predecessor becomes `retired` but remains available
+        for an explicit rollback window.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+        - $ref: '#/components/parameters/CollectionIdPath'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActivationRequest' }
+            example:
+              generation_id: gen_01JX1M7WZ9G9VPHN4HM7FZAAK7
+              expected_active_generation_id: gen_01JX0X7V6K3Y1QMMX6P8G4R9Y2
+      responses:
+        '200':
+          description: Target generation is active.
+          headers:
+            x-trace-id: { $ref: '#/components/headers/TraceId' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Collection' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '503': { $ref: '#/components/responses/DependencyUnavailable' }
+        '504': { $ref: '#/components/responses/DependencyTimeout' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: liveness
+      summary: Check whether the process can answer
+      description: Never calls dependencies and never reports workload saturation.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+      responses:
+        '200':
+          description: Process is alive.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthResponse' }
+              example: { status: alive }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: readiness
+      summary: Perform bounded dependency and compatibility checks
+      description: |
+        Uses a short independent deadline to verify validated configuration, Embedding
+        API availability/capability, vector-store reachability, and catalog readability.
+        It never scans collections. Saturation is represented by admission-control
+        metrics, not by making an otherwise healthy process unready.
+      parameters:
+        - $ref: '#/components/parameters/Traceparent'
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/RequestTimeout'
+      responses:
+        '200':
+          description: The instance may receive application traffic.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessResponse' }
+        '503':
+          description: At least one required readiness check failed or timed out.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ReadinessResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+components:
+  parameters:
+    Traceparent:
+      name: traceparent
+      in: header
+      required: false
+      description: W3C Trace Context. A valid value is continued; invalid syntax starts a new trace.
+      schema:
+        type: string
+        maxLength: 128
+    TraceId:
+      name: x-trace-id
+      in: header
+      required: false
+      description: Legacy correlation ID. Used when no valid `traceparent` is supplied.
+      schema:
+        type: string
+        pattern: '^[A-Za-z0-9._:-]{1,64}$'
+    RequestTimeout:
+      name: x-request-timeout-ms
+      in: header
+      required: false
+      description: Caller budget. Core clamps it to 100–30000 ms and propagates remaining time.
+      schema:
+        type: integer
+        minimum: 100
+        maximum: 30000
+        default: 10000
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Opaque printable key scoped to principal/tenant and operation. The local
+        boilerplate retains completed records for the accepting process lifetime;
+        production deployments require a shared TTL-enforcing store.
+      schema:
+        type: string
+        pattern: '^[\x21-\x7E]{8,128}$'
+    CollectionIdPath:
+      name: collection_id
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/CollectionId' }
+  headers:
+    TraceId:
+      description: Safe correlation identifier generated or propagated by Core.
+      schema: { type: string, pattern: '^[A-Za-z0-9._:-]{1,64}$' }
+    IdempotencyReplayed:
+      description: True only when a stored completed response was returned.
+      schema: { type: boolean }
+  responses:
+    BadRequest:
+      description: Malformed JSON, header, cursor, or protocol-level input.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationError:
+      description: Well-formed input violates a field or business validation rule.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: invalid_request
+            message: The request is invalid.
+            trace_id: 8a31a31cd1464d659f93ac572bc54121
+            details:
+              fields:
+                - { path: query, reason: must not be blank }
+    NotFound:
+      description: The logical collection, generation, or requested resource does not exist.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Contract incompatibility, duplicate identity, lifecycle conflict, or idempotency conflict.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PreconditionFailed:
+      description: An expected active generation is stale or a destructive-action safeguard failed.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    LimitExceeded:
+      description: A document, query, metadata, batch, or configured resource limit was exceeded.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DependencyUnavailable:
+      description: Embedding API, vector store, or catalog is temporarily unavailable.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+        Retry-After:
+          description: Whole seconds when a safe retry delay is known.
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DependencyTimeout:
+      description: A required downstream operation exhausted the remaining request deadline.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    DependencyContractViolation:
+      description: The Embedding API returned a malformed or contradictory response.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InternalError:
+      description: An unexpected internal failure was safely contained.
+      headers:
+        x-trace-id: { $ref: '#/components/headers/TraceId' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    CollectionId:
+      type: string
+      pattern: '^[a-z][a-z0-9-]{2,62}$'
+      examples: [employee-handbook]
+    GenerationId:
+      type: string
+      pattern: '^gen_[0-9A-HJKMNP-TV-Z]{26}$'
+    DocumentId:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+    MetadataValue:
+      oneOf:
+        - type: string
+          maxLength: 512
+        - type: integer
+        - type: number
+          format: double
+        - type: boolean
+    Metadata:
+      type: object
+      maxProperties: 32
+      propertyNames:
+        pattern: '^[A-Za-z][A-Za-z0-9_.-]{0,63}$'
+      additionalProperties:
+        $ref: '#/components/schemas/MetadataValue'
+      description: |
+        Scalar safe metadata only. Keys beginning `_` and reserved keys
+        `tenant_id`, `access_scope`, `document_id`, `document_version`, `chunk_id`,
+        and `chunk_index` are rejected. Total canonical JSON size is at most 16 KiB.
+    IngestDocumentRequest:
+      type: object
+      additionalProperties: false
+      required: [collection_id, document_id, content]
+      properties:
+        collection_id: { $ref: '#/components/schemas/CollectionId' }
+        document_id: { $ref: '#/components/schemas/DocumentId' }
+        content:
+          type: string
+          minLength: 1
+          maxLength: 262144
+          description: Non-blank UTF-8 text, additionally limited to 256 KiB encoded bytes.
+        metadata: { $ref: '#/components/schemas/Metadata' }
+    IngestDocumentResponse:
+      type: object
+      additionalProperties: false
+      required: [collection_id, generation_id, document_id, document_version, chunks_indexed, status]
+      properties:
+        collection_id: { $ref: '#/components/schemas/CollectionId' }
+        generation_id: { $ref: '#/components/schemas/GenerationId' }
+        document_id: { $ref: '#/components/schemas/DocumentId' }
+        document_version: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        chunks_indexed: { type: integer, minimum: 1, maximum: 512 }
+        status: { type: string, const: indexed }
+    DeleteDocumentResponse:
+      type: object
+      additionalProperties: false
+      required: [collection_id, generation_id, document_id, chunks_deleted, status]
+      properties:
+        collection_id: { $ref: '#/components/schemas/CollectionId' }
+        generation_id: { $ref: '#/components/schemas/GenerationId' }
+        document_id: { $ref: '#/components/schemas/DocumentId' }
+        chunks_deleted: { type: integer, minimum: 0 }
+        status: { type: string, const: deleted }
+    RetrievalRequest:
+      type: object
+      additionalProperties: false
+      required: [collection_id, query]
+      properties:
+        collection_id: { $ref: '#/components/schemas/CollectionId' }
+        query:
+          type: string
+          minLength: 1
+          maxLength: 8192
+          description: Non-blank UTF-8 query, additionally limited to 16 KiB encoded bytes.
+        top_k: { type: integer, minimum: 1, maximum: 100, default: 10 }
+        minimum_score:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0
+        filter: { $ref: '#/components/schemas/FilterExpression' }
+    FilterExpression:
+      description: |
+        Provider-neutral boolean expression. Maximum nesting depth is 3 and maximum
+        predicate count is 10. Only fields declared indexed in the active collection
+        contract may be filtered.
+      oneOf:
+        - $ref: '#/components/schemas/FilterAll'
+        - $ref: '#/components/schemas/FilterAny'
+        - $ref: '#/components/schemas/FilterNot'
+        - $ref: '#/components/schemas/FilterPredicate'
+    FilterAll:
+      type: object
+      additionalProperties: false
+      required: [all]
+      properties:
+        all:
+          type: array
+          minItems: 1
+          maxItems: 10
+          items: { $ref: '#/components/schemas/FilterExpression' }
+    FilterAny:
+      type: object
+      additionalProperties: false
+      required: [any]
+      properties:
+        any:
+          type: array
+          minItems: 1
+          maxItems: 10
+          items: { $ref: '#/components/schemas/FilterExpression' }
+    FilterNot:
+      type: object
+      additionalProperties: false
+      required: [not]
+      properties:
+        not: { $ref: '#/components/schemas/FilterExpression' }
+    FilterPredicate:
+      type: object
+      additionalProperties: false
+      required: [field, operator, value]
+      properties:
+        field: { type: string, pattern: '^[A-Za-z][A-Za-z0-9_.-]{0,63}$' }
+        operator:
+          type: string
+          enum: [eq, in, gt, gte, lt, lte]
+        value:
+          description: '`in` requires 1–20 same-typed scalar values; other operators require one scalar.'
+          oneOf:
+            - $ref: '#/components/schemas/MetadataValue'
+            - type: array
+              minItems: 1
+              maxItems: 20
+              items: { $ref: '#/components/schemas/MetadataValue' }
+    RetrievalHit:
+      type: object
+      additionalProperties: false
+      required: [rank, chunk_id, document_id, document_version, text, score, metadata]
+      properties:
+        rank: { type: integer, minimum: 1, maximum: 100 }
+        chunk_id: { type: string, pattern: '^chk_[0-9a-f-]{36}$' }
+        document_id: { $ref: '#/components/schemas/DocumentId' }
+        document_version: { type: string, pattern: '^sha256:[0-9a-f]{64}$' }
+        text: { type: string, minLength: 1 }
+        score:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Metric-normalized relevance, rounded to six decimal places; not a probability.
+        metadata: { $ref: '#/components/schemas/Metadata' }
+    RetrievalResponse:
+      type: object
+      additionalProperties: false
+      required: [collection_id, generation_id, query, top_k, results]
+      properties:
+        collection_id: { $ref: '#/components/schemas/CollectionId' }
+        generation_id: { $ref: '#/components/schemas/GenerationId' }
+        query: { type: string }
+        top_k: { type: integer, minimum: 1, maximum: 100 }
+        results:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/RetrievalHit' }
+    EmbeddingContract:
+      type: object
+      additionalProperties: false
+      required: [model_id, revision, dimension, normalized, distance_metric]
+      properties:
+        model_id: { type: string, minLength: 1, maxLength: 128 }
+        revision:
+          type: string
+          minLength: 7
+          maxLength: 128
+          description: |
+            Caller/configured model artifact identity compared exactly by Core.
+            Operators must supply a pinned immutable revision; Core does not contact
+            the artifact repository to prove that a label is immutable.
+        dimension: { type: integer, minimum: 1, maximum: 65536 }
+        normalized: { type: boolean }
+        distance_metric: { type: string, enum: [cosine, dot, euclid] }
+    MetadataField:
+      type: object
+      additionalProperties: false
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_.-]{0,63}$'
+        type: { type: string, enum: [keyword, integer, float, boolean] }
+        indexed: { type: boolean, default: true }
+    CreateCollectionRequest:
+      type: object
+      additionalProperties: false
+      required: [collection_id, embedding, index_schema_version, metadata_fields, isolation_policy]
+      properties:
+        collection_id: { $ref: '#/components/schemas/CollectionId' }
+        embedding: { $ref: '#/components/schemas/EmbeddingContract' }
+        index_schema_version: { type: integer, minimum: 1, maximum: 2147483647 }
+        metadata_fields:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/MetadataField' }
+        isolation_policy:
+          type: string
+          const: shared
+          description: |
+            V1 supports shared collections with trusted server-derived tenant filters.
+            Per-tenant physical collection provisioning is not implemented.
+    GenerationState:
+      type: string
+      enum: [building, ready, active, retired, failed]
+    CollectionGeneration:
+      type: object
+      additionalProperties: false
+      required:
+        - generation_id
+        - state
+        - embedding
+        - index_schema_version
+        - metadata_fields
+        - isolation_policy
+        - created_at
+      properties:
+        generation_id: { $ref: '#/components/schemas/GenerationId' }
+        state: { $ref: '#/components/schemas/GenerationState' }
+        embedding: { $ref: '#/components/schemas/EmbeddingContract' }
+        index_schema_version: { type: integer, minimum: 1 }
+        metadata_fields:
+          type: array
+          items: { $ref: '#/components/schemas/MetadataField' }
+        isolation_policy: { type: string, const: shared }
+        created_at: { type: string, format: date-time }
+        activated_at: { type: [string, 'null'], format: date-time }
+        source_generation_id:
+          oneOf:
+            - $ref: '#/components/schemas/GenerationId'
+            - type: 'null'
+    Collection:
+      type: object
+      additionalProperties: false
+      required: [collection_id, active_generation_id, retired, generations]
+      properties:
+        collection_id: { $ref: '#/components/schemas/CollectionId' }
+        active_generation_id:
+          oneOf:
+            - $ref: '#/components/schemas/GenerationId'
+            - type: 'null'
+        retired: { type: boolean }
+        generations:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/CollectionGeneration' }
+    CollectionPage:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/Collection' }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+    ProvisionGenerationRequest:
+      type: object
+      additionalProperties: false
+      required: [embedding, index_schema_version, metadata_fields]
+      properties:
+        embedding: { $ref: '#/components/schemas/EmbeddingContract' }
+        index_schema_version: { type: integer, minimum: 1, maximum: 2147483647 }
+        metadata_fields:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/MetadataField' }
+    ProvisionGenerationResponse:
+      type: object
+      additionalProperties: false
+      required: [collection_id, generation_id, state]
+      properties:
+        collection_id: { $ref: '#/components/schemas/CollectionId' }
+        generation_id: { $ref: '#/components/schemas/GenerationId' }
+        state:
+          type: string
+          const: ready
+    ActivationRequest:
+      type: object
+      additionalProperties: false
+      required: [generation_id, expected_active_generation_id]
+      properties:
+        generation_id: { $ref: '#/components/schemas/GenerationId' }
+        expected_active_generation_id: { $ref: '#/components/schemas/GenerationId' }
+    RetirementResponse:
+      type: object
+      additionalProperties: false
+      required: [collection_id, retired, retained_until]
+      properties:
+        collection_id: { $ref: '#/components/schemas/CollectionId' }
+        retired: { type: boolean, const: true }
+        retained_until:
+          type: string
+          format: date-time
+          description: Earliest platform-authorized physical cleanup time.
+    ErrorDetail:
+      type: object
+      additionalProperties: false
+      required: [path, reason]
+      properties:
+        path: { type: string }
+        reason: { type: string }
+    Error:
+      type: object
+      additionalProperties: false
+      required: [code, message, trace_id]
+      properties:
+        code:
+          type: string
+          enum:
+            - invalid_request
+            - limit_exceeded
+            - not_found
+            - conflict
+            - collection_already_exists
+            - generation_not_ready
+            - embedding_schema_mismatch
+            - idempotency_conflict
+            - precondition_failed
+            - embedding_unavailable
+            - embedding_timeout
+            - embedding_contract_violation
+            - vector_store_unavailable
+            - vector_store_timeout
+            - internal_error
+        message: { type: string, maxLength: 512 }
+        trace_id: { type: string, pattern: '^[A-Za-z0-9._:-]{1,64}$' }
+        details:
+          type: object
+          additionalProperties: true
+          description: Safe machine-readable fields or limits; never stack traces or provider payloads.
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, const: alive }
+    ReadinessCheck:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        code: { type: [string, 'null'] }
+    ReadinessResponse:
+      type: object
+      additionalProperties: false
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ready, not_ready] }
+        checks:
+          type: object
+          additionalProperties: false
+          required: [configuration, embedding, vector_store, catalog]
+          properties:
+            configuration: { $ref: '#/components/schemas/ReadinessCheck' }
+            embedding: { $ref: '#/components/schemas/ReadinessCheck' }
+            vector_store: { $ref: '#/components/schemas/ReadinessCheck' }
+            catalog: { $ref: '#/components/schemas/ReadinessCheck' }

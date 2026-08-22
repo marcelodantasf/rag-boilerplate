@@ -1,0 +1,98 @@
+groups:
+  - name: rag-service-health
+    rules:
+      - alert: RagCoreUnavailable
+        expr: absent(rag_core_http_requests_total{service_name="rag-core-api"})
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: RAG Core OTLP request telemetry is unavailable
+          runbook: Check Core readiness, collector reachability, exporter errors, and recent restarts.
+
+      - alert: RagCoreHighErrorRate
+        expr: |
+          sum(rate(rag_core_http_requests_total{service_name="rag-core-api",http_response_status_code=~"5.."}[5m]))
+          /
+          clamp_min(sum(rate(rag_core_http_requests_total{service_name="rag-core-api"}[5m])), 0.001)
+          > 0.01
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: RAG Core 5xx ratio is above 1%
+          runbook: Correlate error codes and traces; do not inspect or export raw request text.
+
+      - alert: RagCoreRetrievalP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(rag_core_retrieval_duration_milliseconds_bucket[10m]))) > 750
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: Retrieval p95 exceeds the 750 ms reference objective
+          runbook: Split Core, embedding, and vector-search spans to locate latency.
+
+      - alert: RagCoreContractMismatchSpike
+        expr: sum(increase(rag_core_contract_mismatches_total[10m])) > 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: Embedding or vector collection contract mismatches detected
+          runbook: Stop rollout and verify model revision, dimension, normalization, and active generation.
+
+      - alert: RagCoreMigrationFailed
+        expr: sum(increase(rag_core_generation_operations_total{phase="failed"}[15m])) > 0
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: Collection generation provisioning failed
+          runbook: Keep the current generation active; inspect the generation phase trace and safe failure code.
+
+  - name: rag-dependencies-and-capacity
+    rules:
+      - alert: QdrantUnavailable
+        expr: up{job="qdrant"} == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: Qdrant is unavailable to monitoring
+          runbook: Check Qdrant health, storage availability, and container restarts.
+
+      - alert: QdrantContainerMemoryHigh
+        expr: |
+          max(container_memory_working_set_bytes{name=~".*qdrant.*"})
+          /
+          clamp_min(max(container_spec_memory_limit_bytes{name=~".*qdrant.*"}), 1)
+          > 0.85
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: Qdrant memory usage exceeds 85% of its container limit
+          runbook: Review vector count, index configuration, query concurrency, and the declared limit.
+
+      - alert: QdrantFilesystemPressure
+        expr: |
+          max(container_fs_usage_bytes{name=~".*qdrant.*"})
+          /
+          clamp_min(max(container_fs_limit_bytes{name=~".*qdrant.*"}), 1)
+          > 0.80
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: Qdrant filesystem usage exceeds 80%
+          runbook: Verify snapshot retention, collection growth, and available persistent storage.
+
+      - alert: QdrantSnapshotStale
+        expr: time() - max(qdrant_snapshot_last_success_timestamp_seconds) > 86400
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: Last successful Qdrant snapshot is older than 24 hours
+          runbook: Check the external snapshot job and remote snapshot storage; Core does not create backups.
+
+      - alert: RagContainerRestartLoop
+        expr: increase(container_start_time_seconds{name=~".*(core-rag-api|embedding-api|qdrant).*"}[15m]) > 2
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: A RAG stack container restarted repeatedly
+          runbook: Check bounded readiness, resource pressure, and the safe startup error log.

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rag-boilerplate-embedding-api"
+version = "0.1.0"
+description = "General-purpose text embedding API"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi==0.116.1",
+  "sentence-transformers==5.1.0",
+  "uvicorn[standard]==0.35.0",
+]
+
+[project.scripts]
+embedding-api = "embedding_api.__main__:main"
+
+[project.optional-dependencies]
+test = [
+  "httpx==0.28.1",
+  "pytest==8.4.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/embedding_api"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
