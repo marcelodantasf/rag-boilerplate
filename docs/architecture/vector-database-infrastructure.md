@@ -4,10 +4,10 @@
 
 The vector database is infrastructure, not a public third microservice. RAG Core is its exclusive application client; neither consumer apps nor the Embedding API receives a database URL or credential.
 
-\`\`\`text
+```text
 Client/public network → RAG Core → private data network → Vector DB
 Embedding API ────────────────┘     (no vector DB access)
-\`\`\`
+```
 
 | Owner | Responsibility |
 | --- | --- |
@@ -22,13 +22,13 @@ This prevents provider details from becoming a client contract and centralizes f
 
 Treat a collection as a versioned index contract, not merely a name. Record or enforce:
 
-\`\`\`text
+```text
 collection_id, index_schema_version, embedding model + revision,
 vector dimension, distance metric, payload fields/indexes,
 tenant isolation strategy, created_at, migration state
-\`\`\`
+```
 
-Each point represents a chunk. Typical payload: \`document_id\`, \`chunk_id\`, \`chunk_index\`, chunk text (or a content reference), safe metadata, embedding model, and schema version.
+Each point represents a chunk. Typical payload: `document_id`, `chunk_id`, `chunk_index`, chunk text (or a content reference), safe metadata, embedding model, and schema version.
 
 Use deterministic point IDs based on collection, document, document content/version hash, and chunk index. Upserts then become retry-safe, document deletion is precise, and ingestion is idempotent.
 
